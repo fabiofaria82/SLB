@@ -1,0 +1,202 @@
+# app.py
+# Streamlit dashboard para explorar e plotar logs do sistema (ex.: Nilo_Min.csv)
+
+import io
+import sys
+import pandas as pd
+import numpy as np
+import streamlit as st
+import plotly.express as px
+
+st.set_page_config(page_title="PV-BESS Data Explorer", layout="wide")
+
+# -------------------------
+# Utilitários
+# -------------------------
+CANDIDATE_TIME_COLS = [
+    "timestamp","time","date","datetime","data","datahora","date_time","ts"
+]
+
+def try_read_csv(file, encoding_opts=("utf-8", "latin1")):
+    # Tenta detectar separador (',' ';' '\t') e decimal ('.' ou ',')
+    # e retorna df + parâmetros detectados
+    last_error = None
+    for enc in encoding_opts:
+        for dec in ('.', ','):
+            try:
+                df = pd.read_csv(
+                    file,
+                    encoding=enc,
+                    engine="python",
+                    sep=None,  # usa sniffing do pandas
+                    decimal=dec,
+                    dtype=str  # lê tudo como str para limpar depois
+                )
+                return df, enc, dec
+            except Exception as e:
+                last_error = e
+                file.seek(0) if hasattr(file, "seek") else None
+    raise last_error
+
+def coerce_numeric(df):
+    out = df.copy()
+    for c in out.columns:
+        # ignora col de tempo (detectar depois)
+        out[c] = pd.to_numeric(out[c].str.replace(',', '.', regex=False), errors="ignore")
+    return out
+
+def detect_time_col(df):
+    # 1) tenta nomes mais comuns
+    cols = list(df.columns)
+    for candidate in CANDIDATE_TIME_COLS:
+        for c in cols:
+            if c.strip().lower() == candidate:
+                return c
+    # 2) tenta converter cada coluna pra datetime e vê taxa de sucesso
+    best_col = None
+    best_ok = 0
+    for c in cols:
+        try:
+            parsed = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True, dayfirst=False)
+            ok = parsed.notna().mean()
+            if ok > best_ok and ok > 0.8:
+                best_ok = ok
+                best_col = c
+        except Exception:
+            pass
+    return best_col
+
+def parse_datetime_col(df, time_col):
+    dt = pd.to_datetime(df[time_col], errors="coerce", infer_datetime_format=True)
+    # Se maioria for NaT, tenta dayfirst=True
+    if dt.notna().mean() < 0.8:
+        dt = pd.to_datetime(df[time_col], errors="coerce", infer_datetime_format=True, dayfirst=True)
+    return dt
+
+def resample_df(df, rule, agg="mean"):
+    if not rule or rule == "No resample":
+        return df
+    if agg == "mean":
+        return df.resample(rule).mean(numeric_only=True)
+    elif agg == "median":
+        return df.resample(rule).median(numeric_only=True)
+    elif agg == "sum":
+        return df.resample(rule).sum(numeric_only=True)
+    else:
+        return df.resample(rule).mean(numeric_only=True)
+
+# -------------------------
+# UI
+# -------------------------
+st.title("🔋 PV-BESS Data Explorer (Streamlit)")
+st.caption("Carregue seu CSV (ex.: Nilo_Min.csv), escolha a coluna de tempo, filtre o período e plote métricas.")
+
+with st.sidebar:
+    st.header("📂 Entrada de dados")
+    uploaded = st.file_uploader("CSV com dados do sistema", type=["csv"])
+    st.markdown("---")
+    st.header("⚙️ Opções de plotagem")
+    resample_rule = st.selectbox(
+        "Reamostrar (opcional)",
+        ["No resample", "1T (1 min)", "5T (5 min)", "15T", "30T", "1H", "6H", "1D"],
+        index=1
+    )
+    resample_map = {
+        "No resample": None,
+        "1T (1 min)": "1T", "5T (5 min)": "5T", "15T": "15T", "30T": "30T",
+        "1H": "1H", "6H": "6H", "1D": "1D"
+    }
+    agg = st.selectbox("Agregação", ["mean", "median", "sum"], index=0)
+
+if not uploaded:
+    st.info("Faça upload do CSV na barra lateral para começar.")
+    st.stop()
+
+# Lê CSV
+buffer = io.BytesIO(uploaded.read())
+df_raw, enc, dec = try_read_csv(buffer)
+df_raw = df_raw.dropna(how="all").copy()
+
+# Detecta/seleciona coluna de tempo
+time_col_guess = detect_time_col(df_raw)
+st.success(f"Arquivo carregado com encoding **{enc}**, decimal **'{dec}'**.")
+time_col = st.selectbox("Coluna de tempo (datetime)", options=list(df_raw.columns), index=(list(df_raw.columns).index(time_col_guess) if time_col_guess in df_raw.columns else 0))
+dt = parse_datetime_col(df_raw, time_col)
+
+# Prepara DataFrame
+df = df_raw.copy()
+df[time_col] = dt
+df = df[df[time_col].notna()].copy()
+df = coerce_numeric(df)
+df = df.set_index(time_col).sort_index()
+
+if df.empty:
+    st.error("Não foi possível parsear a coluna de tempo. Verifique o formato do timestamp.")
+    st.stop()
+
+# Cobertura temporal
+t0, t1 = df.index.min(), df.index.max()
+duration = t1 - t0
+st.subheader("⏱️ Cobertura temporal dos dados")
+c1, c2, c3 = st.columns(3)
+c1.metric("Início", t0.strftime("%Y-%m-%d %H:%M:%S"))
+c2.metric("Fim", t1.strftime("%Y-%m-%d %H:%M:%S"))
+c3.metric("Duração", str(duration))
+
+# Seleção de período
+st.markdown("### 🎚️ Filtro de período")
+time_range = st.slider(
+    "Selecione o intervalo",
+    min_value=t0.to_pydatetime(),
+    max_value=t1.to_pydatetime(),
+    value=(t0.to_pydatetime(), t1.to_pydatetime()),
+    format="YYYY-MM-DD HH:mm"
+)
+df = df.loc[(df.index >= pd.to_datetime(time_range[0])) & (df.index <= pd.to_datetime(time_range[1]))]
+
+# Reamostragem
+rule = resample_map[resample_rule]
+df_res = resample_df(df, rule, agg=agg)
+
+# Seleção de colunas numéricas
+num_cols = [c for c in df_res.columns if pd.api.types.is_numeric_dtype(df_res[c])]
+default_cols = [c for c in num_cols if c.lower() in ("soc","voltage","current","power","temperature","temp","t1","t2","t3","t4")]
+st.markdown("### 📈 Seleção de variáveis para plotagem")
+cols_to_plot = st.multiselect("Colunas numéricas", options=num_cols, default=default_cols or num_cols[:4])
+
+# Visão geral
+with st.expander("📋 Estatísticas descritivas (dados filtrados / reamostrados)"):
+    st.dataframe(df_res[cols_to_plot].describe().T, use_container_width=True)
+
+# Plots
+tabs = st.tabs(["Time Series", "Correlation", "Raw Preview", "Download"])
+
+with tabs[0]:
+    st.subheader("📈 Séries temporais")
+    if cols_to_plot:
+        fig = px.line(df_res.reset_index(), x=df_res.index.name, y=cols_to_plot)
+        fig.update_layout(height=500, margin=dict(l=10,r=10,t=40,b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Selecione ao menos uma coluna para plotar.")
+
+with tabs[1]:
+    st.subheader("🔗 Correlação (heatmap)")
+    if len(num_cols) >= 2:
+        corr = df_res[num_cols].corr(numeric_only=True)
+        figc = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r", origin="lower")
+        figc.update_layout(height=500, margin=dict(l=10,r=10,t=40,b=10))
+        st.plotly_chart(figc, use_container_width=True)
+    else:
+        st.info("São necessárias pelo menos duas colunas numéricas para a correlação.")
+
+with tabs[2]:
+    st.subheader("🧾 Amostra dos dados")
+    st.dataframe(df_res.head(50), use_container_width=True)
+
+with tabs[3]:
+    st.subheader("📥 Baixar dados filtrados")
+    csv_out = df_res.to_csv(index=True).encode("utf-8")
+    st.download_button("Download CSV", data=csv_out, file_name="dados_filtrados.csv", mime="text/csv")
+
+st.caption("Dica: se sua coluna de tempo não for detectada automaticamente, selecione-a manualmente no seletor acima. Use a reamostragem para suavizar ruído (ex.: 15T, 1H).")
